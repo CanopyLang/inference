@@ -1,0 +1,298 @@
+module RestoreEngine exposing
+    ( Options, defaults
+    , RestoredImage, handleToInt, width, height
+    , process, processBlob, release
+    , bitmap, bitmapHandle
+    , deviceTier, DeviceTier(..)
+    )
+
+{-| On-device photo restoration — the `canopy/inference` capability.
+
+`RestoreEngine` runs an ONNX model over a decoded image **entirely in native C++**, where
+the model runtime (ONNX Runtime, the CPU execution provider) and the memory budget live. It
+consumes an `Image.ImageHandle` (a blob living in `canopy/native`'s `BlobRegistry`) and
+produces a NEW handle for the restored result — **pixels never cross the ABI**, only the
+opaque integer handles do (see `canopy/image` and `plan/canopy` handle discipline).
+
+Unlike the pure-Java capabilities (Photos, Share, Storage) that reuse the generic
+`canopy::JniModule`, `RestoreEngine` is backed by a REAL C++ `NativeModule`
+(`RestoreEngineModule`, the ORT sibling of `EchoModule`): the heavy tensor work runs on its
+own worker thread and the completion is hopped back to the JS thread, exactly the C1 gate.
+
+    call → ORT worker thread → ctx.complete → postToJs → __canopy_resolve → update
+
+`process` is a one-shot async `Cmd` — a `Task` over `Native.Module.call "RestoreEngine"`,
+exactly like `Image.decode` is a `Task` over `Native.Module.call "Image"`. There is no
+`subscription` (no streaming progress), so this is an ordinary module, not an `effect
+module`. (A future progress-reporting variant would graduate to a `canopy/*` effect module
+using `Native.Module.callStreaming`, like the billing/batch ticks in `Echo.ticks`.)
+
+The restored result is its OWN opaque `RestoredImage` handle (not an `Image.ImageHandle`,
+whose constructor `canopy/image` keeps private) but it names a blob in the *same* native
+`BlobRegistry`, so it renders through the same `CanopyBitmap` native view — use
+`RestoreEngine.bitmap`. Pass its raw int into another capability with `handleToInt`.
+
+> **Model note — STAND-IN, not the real face model.** The bundled model is ESPCN
+> `super-resolution-10.onnx`, a **single-channel (Y / luma) 3× super-resolution** network.
+> It is a *stand-in* that proves the full ORT path (decode → tensor → session → recombine →
+> blob). It is NOT a face-restoration or colorization model: the `restoreFaces` and
+> `colorize` options are accepted and forwarded for API stability but the stand-in does not
+> implement them (the host honors `upscale` via the super-res pass and blends by `strength`).
+> Swapping in a real GFPGAN/CodeFormer/DDColor `.onnx` is a host-side asset + tensor-shape
+> change only; this Canopy API is unchanged.
+
+    import RestoreEngine
+    import Image
+    import Native.Module as NM
+
+    type Msg
+        = Restored (Result NM.Error RestoreEngine.RestoredImage)
+
+    -- restore a decoded photo with default options:
+    RestoreEngine.process picked RestoreEngine.defaults Restored
+
+    -- show the result (zero-copy native view, same blob registry as canopy/image):
+    RestoreEngine.bitmap [ A.width 320, A.height 240 ] restored
+
+# Options
+@docs Options, defaults
+
+# Handles
+@docs RestoredImage, handleToInt, width, height
+
+# Restoration
+@docs process, processBlob, release
+
+# Display
+@docs bitmap, bitmapHandle
+
+# Capability probe
+@docs deviceTier, DeviceTier
+
+-}
+
+import Image exposing (ImageHandle)
+import Json.Decode as Decode
+import Json.Encode as Encode
+import Native.Module as NM
+import Task
+import VirtualDom
+
+
+
+-- OPTIONS
+
+
+{-| How to restore. The host honors `upscale` (the ESPCN super-res pass) and `strength`
+(0..1, how strongly the restored result is blended over a bicubic baseline); `restoreFaces`
+and `colorize` are forwarded for API stability but are no-ops with the ESPCN stand-in model
+(see the module note).
+
+  - `upscale` — run the super-resolution pass (3× with the bundled ESPCN model).
+  - `restoreFaces` — request face enhancement (stand-in: no-op).
+  - `colorize` — request colorization of a grayscale source (stand-in: no-op).
+  - `strength` — 0..1 blend of the model output over a plain bicubic upscale.
+
+-}
+type alias Options =
+    { upscale : Bool
+    , restoreFaces : Bool
+    , colorize : Bool
+    , strength : Float
+    }
+
+
+{-| Sensible defaults: upscale on, face/colorize off, full strength. -}
+defaults : Options
+defaults =
+    { upscale = True
+    , restoreFaces = False
+    , colorize = False
+    , strength = 1.0
+    }
+
+
+encodeOptions : Options -> Encode.Value
+encodeOptions opts =
+    Encode.object
+        [ ( "upscale", Encode.bool opts.upscale )
+        , ( "restoreFaces", Encode.bool opts.restoreFaces )
+        , ( "colorize", Encode.bool opts.colorize )
+        , ( "strength", Encode.float (clamp 0.0 1.0 opts.strength) )
+        ]
+
+
+
+-- HANDLES
+
+
+{-| An opaque reference to a restored bitmap living in the `canopy/native` `BlobRegistry`.
+
+Carries the int handle plus the restored pixel dimensions the host reported. The constructor
+is NOT exposed — a handle is only ever minted by `process`, so it cannot name a blob that
+does not exist. Release it with `release` when you are done (manual refcounting; the GC never
+sees the pixels). It names a blob in the same registry as `canopy/image`, so the same native
+`CanopyBitmap` view renders it.
+-}
+type RestoredImage
+    = RestoredImage Int Int Int
+
+
+{-| The raw integer behind a restored handle — for passing it into another capability's
+`argsJson` (e.g. `Image.encodeToFile` to save the restored photo, by reconstructing its
+`ImageHandle`-shaped args from this int). -}
+handleToInt : RestoredImage -> Int
+handleToInt (RestoredImage h _ _) =
+    h
+
+
+{-| Restored width in pixels. -}
+width : RestoredImage -> Int
+width (RestoredImage _ w _) =
+    w
+
+
+{-| Restored height in pixels. -}
+height : RestoredImage -> Int
+height (RestoredImage _ _ h) =
+    h
+
+
+
+-- DECODERS (internal)
+
+
+handleDecoder : Decode.Decoder RestoredImage
+handleDecoder =
+    Decode.map3 RestoredImage
+        (Decode.field "image" Decode.int)
+        (Decode.field "width" Decode.int)
+        (Decode.field "height" Decode.int)
+
+
+
+-- RESTORATION
+
+
+{-| Restore `handle` (any decoded `Image.ImageHandle`) with `options`, producing a NEW
+`RestoredImage` for the result. The input handle is NOT consumed — release both if you keep
+both (manual refcounting; the GC never sees the pixels). The work runs on a native ORT worker
+thread; cancelling the spawned `Process` calls `__canopy_cancel`, which the host honors
+between tensor steps.
+
+    RestoreEngine.process picked RestoreEngine.defaults Restored
+
+-}
+process : ImageHandle -> Options -> (Result NM.Error RestoredImage -> msg) -> Cmd msg
+process handle options toMsg =
+    NM.call "RestoreEngine"
+        "process"
+        (Encode.object
+            [ ( "image", Encode.int (Image.handleToInt handle) )
+            , ( "options", encodeOptions options )
+            ]
+        )
+        handleDecoder
+        |> Task.attempt toMsg
+
+
+{-| Restore directly from a RAW blob handle int with `options`, producing a NEW
+`RestoredImage` for the result. This is the ergonomic entry for capabilities that hand you
+an opaque blob int rather than a typed `Image.ImageHandle` — e.g. `Photos.pick`, whose
+`PhotoHandle` names a blob in the SAME native `BlobRegistry` as `Image` (so the int is a
+valid restore input without a re-decode). The host `RestoreEngineModule.process` reads its
+input purely by the `"image"` JSON key, so this builds the *identical* wire shape as
+`process`; it only skips reconstructing an `ImageHandle` you do not have.
+
+    -- restore the photo the user just picked (Photos hands back a blob int):
+    RestoreEngine.processBlob (Photos.handleToInt picked) RestoreEngine.defaults Restored
+
+As with `process`, the input blob is NOT consumed; release it through its owning capability
+when done. The work runs on the same native ORT worker thread.
+
+-}
+processBlob : Int -> Options -> (Result NM.Error RestoredImage -> msg) -> Cmd msg
+processBlob handleInt options toMsg =
+    NM.call "RestoreEngine"
+        "process"
+        (Encode.object
+            [ ( "image", Encode.int handleInt )
+            , ( "options", encodeOptions options )
+            ]
+        )
+        handleDecoder
+        |> Task.attempt toMsg
+
+
+{-| Release one reference on a restored handle, freeing the native pixels at zero. Routes
+through the same `RestoreEngine` module (the host releases against the shared registry). The
+outcome is delivered to `toMsg` (almost always discarded). Forgetting to call this leaks
+native memory the GC cannot reclaim. -}
+release : RestoredImage -> (Result NM.Error () -> msg) -> Cmd msg
+release (RestoredImage h _ _) toMsg =
+    NM.call "RestoreEngine" "release" (Encode.object [ ( "image", Encode.int h ) ]) (Decode.succeed ())
+        |> Task.attempt toMsg
+
+
+
+-- DISPLAY
+
+
+{-| A native view that draws a `RestoredImage` directly — zero-copy, reusing the
+`CanopyBitmap` component `canopy/image` registers (an `ImageView` on Android). The handle is
+passed as the `bitmapHandle` prop; size it with the usual `Native.Attributes`.
+
+    RestoreEngine.bitmap [ A.width 320, A.height 240, A.borderRadius 12 ] restored
+
+-}
+bitmap : List (VirtualDom.Attribute msg) -> RestoredImage -> VirtualDom.Node msg
+bitmap attrs handle =
+    VirtualDom.node "CanopyBitmap" (bitmapHandle handle :: attrs) []
+
+
+{-| The `bitmapHandle` prop for composing a `CanopyBitmap` by hand. Encodes the handle's int
+so the host can `nativeBlobGetBitmap` it (same registry as `canopy/image`). -}
+bitmapHandle : RestoredImage -> VirtualDom.Attribute msg
+bitmapHandle (RestoredImage h _ _) =
+    VirtualDom.property "bitmapHandle" (Encode.int h)
+
+
+
+-- CAPABILITY PROBE
+
+
+{-| Which compute path the host would use for inference. A stub today (the ESPCN stand-in
+always runs on the CPU execution provider); a real build reports NNAPI/GPU/CPU so a UI can
+warn before a slow restore. -}
+type DeviceTier
+    = Cpu
+    | Nnapi
+    | Gpu
+    | Unknown String
+
+
+{-| Probe the device's inference tier (see `DeviceTier`). One-shot async `Cmd`. -}
+deviceTier : (Result NM.Error DeviceTier -> msg) -> Cmd msg
+deviceTier toMsg =
+    NM.call "RestoreEngine" "deviceTier" (Encode.object []) deviceTierDecoder
+        |> Task.attempt toMsg
+
+
+deviceTierDecoder : Decode.Decoder DeviceTier
+deviceTierDecoder =
+    Decode.field "tier" Decode.string
+        |> Decode.map
+            (\tier ->
+                case tier of
+                    "cpu" ->
+                        Cpu
+
+                    "nnapi" ->
+                        Nnapi
+
+                    "gpu" ->
+                        Gpu
+
+                    other ->
+                        Unknown other
+            )

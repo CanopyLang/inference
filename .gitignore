@@ -1,0 +1,8 @@
+# canopy/inference package — ignore regenerable build caches.
+# Keep: src, tests, external (FFI), canopy.json.
+canopy-stuff/
+artifacts.dat
+*.elco
+node_modules/
+.DS_Store
+*.log

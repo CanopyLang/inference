@@ -1,0 +1,85 @@
+module Test.RestoreEngine exposing (main, tests)
+
+{-| Pure-value unit tests for the `canopy/inference` `RestoreEngine` API — runs entirely on
+Linux, no native, no host.
+
+`process` and `processBlob` produce an opaque `Cmd msg` whose JSON wire shape cannot be
+introspected from pure Canopy, so these tests guard what IS pure-observable: that the public
+surface used by app code (e.g. Lumen's Main.can) exists and that the `Options` contract both
+restoration entry points forward is exactly the documented one. The wire shape itself
+(method `"process"`, key `"image"`:int, `"options"`:object) is exercised end-to-end by the
+Lumen headless smoke (apps/lumen/harness/smoke.js), which asserts a real RestoreEngine.process
+call carrying an int blob handle when `processBlob` runs.
+-}
+
+import Basics exposing (..)
+import Expect
+import RestoreEngine
+import Test exposing (..)
+
+
+main : Test
+main =
+    tests
+
+
+tests : Test
+tests =
+    describe "RestoreEngine"
+        [ defaultsTests
+        , optionsShapeTests
+        ]
+
+
+defaultsTests : Test
+defaultsTests =
+    describe "defaults — the Options the engine honors"
+        [ test "upscale is on (the ESPCN super-res pass)" <|
+            \() ->
+                RestoreEngine.defaults.upscale
+                    |> Expect.equal True
+        , test "restoreFaces is off (stand-in model is super-res only)" <|
+            \() ->
+                RestoreEngine.defaults.restoreFaces
+                    |> Expect.equal False
+        , test "colorize is off (stand-in model is super-res only)" <|
+            \() ->
+                RestoreEngine.defaults.colorize
+                    |> Expect.equal False
+        , test "strength is full (1.0)" <|
+            \() ->
+                RestoreEngine.defaults.strength
+                    |> Expect.within (Expect.Absolute 0.0001) 1.0
+        ]
+
+
+optionsShapeTests : Test
+optionsShapeTests =
+    describe "Options — the record both process and processBlob forward"
+        [ test "an Options can be constructed with all four fields and read back" <|
+            \() ->
+                let
+                    opts : RestoreEngine.Options
+                    opts =
+                        { upscale = True
+                        , restoreFaces = False
+                        , colorize = False
+                        , strength = 0.85
+                        }
+                in
+                ( opts.upscale, opts.restoreFaces, opts.colorize )
+                    |> Expect.equal ( True, False, False )
+        , test "strength round-trips through the Options record" <|
+            \() ->
+                let
+                    opts : RestoreEngine.Options
+                    opts =
+                        { upscale = True
+                        , restoreFaces = True
+                        , colorize = True
+                        , strength = 0.6
+                        }
+                in
+                opts.strength
+                    |> Expect.within (Expect.Absolute 0.0001) 0.6
+        ]
