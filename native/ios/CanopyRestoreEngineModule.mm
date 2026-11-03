@@ -55,9 +55,13 @@
 #import "CanopyModuleSupport.h"
 #import "CanopyBlobRegistryHost.h"   // §6.3 globalBlobRegistry
 #include "CanopyBlobs.h"
+#include "RestoreTiling.h"           // pure seamless-tiling geometry (Tile1D / tileCover), shared with the cpp
+#include "RestoreColor.h"            // pure sRGB<->CIELAB for the colorize (L->ab) path, shared with the cpp
 
-// The ESPCN stand-in is single-channel Y: input [1,1,224,224], output [1,1,672,672] (3x).
-// (Identical to RestoreEngineModule.h:22-26.)
+// Defaults for the single-channel Y ESPCN stand-in: input [1,1,224,224], output [1,1,672,672] (3x).
+// The real contract is read at load time from the model shape (see -ensureModel): a 1-channel input
+// keeps the YCbCr path below; a 3-channel [1,3,D,D] input dispatches to -runProcessRgb (the shipped
+// enhance/face/SR models). (Mirrors RestoreEngineModule.h:21-33 / the cpp OrtState.)
 static const int kModelIn  = 224;
 static const int kModelOut = 672;
 
@@ -113,6 +117,11 @@ static std::vector<float> resizePlane(const std::vector<float>& src, int srcW, i
   std::mutex _modelMu;
   std::shared_ptr<std::unordered_map<std::string, std::shared_ptr<std::atomic<bool>>>> _cancelFlags;
   std::mutex _cancelMu;
+  // Model I/O contract, read from the loaded model's shape (mirrors the cpp OrtState fields):
+  int _inChannels;          // 1 = Y-plane ESPCN stand-in; 3 = RGB image->image
+  int _inDim;               // fixed square input spatial (H==W); kModelIn fallback
+  int _outChannels;         // 1 = same; 2 = colorize L->ab (not wired yet)
+  BOOL _rgb;
 }
 
 - (instancetype)init {
@@ -209,6 +218,24 @@ static std::vector<float> resizePlane(const std::vector<float>& src, int srcW, i
   const int W = in->width, H = in->height;
   const size_t n = (size_t)W * H;
 
+  // Load the model up-front (idempotent/cached) to read its I/O contract and choose a path. A real
+  // RGB model replaces the ESPCN stand-in with no code change. A load FAILURE (not "no-model") falls
+  // through to the Y-plane path, which keeps its bicubic degrade-gracefully behavior.
+  NSString *ensErr = nil;
+  if ([self ensureModel:&ensErr]) {
+    if (_rgb) { [self runProcessRgb:in strength:strength cancelled:cancelled complete:complete]; return; }
+    if (_inChannels == 1 && _outChannels == 2) {
+      [self runProcessColorize:in strength:strength cancelled:cancelled complete:complete]; return;
+    }
+    if (_outChannels != 1) {
+      CanopyReject(complete, @"rejected", @"unsupported model I/O (expected Y 1->1, RGB 3->3, or colorize 1->2)");
+      return;
+    }
+  } else if (ensErr != nil && [ensErr isEqualToString:@"no-model"]) {
+    CanopyReject(complete, @"rejected", @"RestoreEngine: no model bytes set");
+    return;
+  }
+
   // --- RGBA -> YCbCr (BT.601 full-range). Y in [0,1] for the model; Cb/Cr kept in [0,255]. ---
   std::vector<float> Y(n), Cb(n), Cr(n);
   const uint8_t* px = in->bytes.data();
@@ -265,6 +292,253 @@ static std::vector<float> resizePlane(const std::vector<float>& src, int srcW, i
 
   canopy::BlobHandle outHandle = canopy::globalBlobRegistry().put(std::move(out));
   CanopyResolve(complete, @{ @"image": @(outHandle), @"width": @(OW), @"height": @(OH) });
+}
+
+// ---- the RGB image->image pass (3-channel models: enhance / face / RGB super-res) -------------
+// Mirrors RestoreEngineModule.cpp::runProcessRgb (shared RestoreTiling.h): cover the frame with FIXED
+// DxD windows, run each [1,3,D,D] -> [1,3,oh,ow], stitch each window's seam-cropped central span into a
+// full-res canvas, then strength-blend over the bicubic baseline. 1x model -> W×H; integer-scale SR ->
+// W·s×H·s. One window covers a ≤D image (edge-clamped, never downscaled); many tile a large photo.
+- (void)runProcessRgb:(std::shared_ptr<canopy::Blob>)in
+             strength:(double)strength
+            cancelled:(std::shared_ptr<std::atomic<bool>>)cancelled
+             complete:(CanopyComplete)complete {
+  const int W = in->width, H = in->height;
+  const size_t n = (size_t)W * H;
+  const int D = _inDim;
+  const int over = MIN(32, D / 4 > 0 ? D / 4 : 1);
+  const float s = (float)strength;
+  const uint8_t *px = in->bytes.data();
+  std::vector<float> R(n), G(n), B(n);
+  for (size_t i = 0; i < n; ++i) { R[i] = px[i * 4 + 0]; G[i] = px[i * 4 + 1]; B[i] = px[i * 4 + 2]; }
+
+  int npx = D, npy = D;
+  std::vector<canopy::Tile1D> txs = canopy::tileCover(W, D, over, npx);
+  std::vector<canopy::Tile1D> tys = canopy::tileCover(H, D, over, npy);
+  const size_t plane = (size_t)D * D;
+
+  MLModelDescription *desc = _model.modelDescription;
+  NSString *inName = desc.inputDescriptionsByName.allKeys.firstObject ?: @"input";
+  NSString *outName = desc.outputDescriptionsByName.allKeys.firstObject ?: @"output";
+
+  int sx = 0, sy = 0, cw = 0, ch = 0;
+  std::vector<float> canR, canG, canB;
+
+  for (const canopy::Tile1D &ty : tys) {
+    for (const canopy::Tile1D &tx : txs) {
+      if (cancelled->load()) { CanopyReject(complete, @"cancelled", @"process cancelled"); return; }
+
+      // Build the DxD window by edge-clamped sampling, packed NCHW [1,3,D,D] in [0,1].
+      NSError *maErr = nil;
+      MLMultiArray *input = [[MLMultiArray alloc] initWithShape:@[ @1, @3, @(D), @(D) ]
+                                                       dataType:MLMultiArrayDataTypeFloat32
+                                                          error:&maErr];
+      if (input == nil) { CanopyReject(complete, @"rejected", @"RestoreEngine: RGB input alloc failed"); return; }
+      float *dst = (float *)input.dataPointer;
+      for (int yy = 0; yy < D; ++yy) {
+        int syc = ty.win + yy; if (syc < 0) syc = 0; else if (syc >= H) syc = H - 1;
+        for (int xx = 0; xx < D; ++xx) {
+          int sxc = tx.win + xx; if (sxc < 0) sxc = 0; else if (sxc >= W) sxc = W - 1;
+          const size_t si = (size_t)syc * W + sxc, di = (size_t)yy * D + xx;
+          dst[di] = R[si] / 255.0f; dst[plane + di] = G[si] / 255.0f; dst[2 * plane + di] = B[si] / 255.0f;
+        }
+      }
+
+      MLDictionaryFeatureProvider *features =
+          [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{ inName: input } error:&maErr];
+      if (features == nil) { CanopyReject(complete, @"rejected", @"RestoreEngine: RGB feature provider failed"); return; }
+      NSError *predErr = nil;
+      id<MLFeatureProvider> result = [_model predictionFromFeatures:features error:&predErr];
+      if (result == nil) { CanopyReject(complete, @"rejected", @"RestoreEngine: RGB prediction failed"); return; }
+      MLMultiArray *output = [result featureValueForName:outName].multiArrayValue;
+      if (output == nil || output.dataType != MLMultiArrayDataTypeFloat32) {
+        CanopyReject(complete, @"rejected", @"RestoreEngine: RGB output missing/!float32"); return;
+      }
+      int oh = D, ow = D;
+      NSArray<NSNumber *> *osh = output.shape;
+      if (osh.count == 4) {
+        if (osh[1].intValue != 3) { CanopyReject(complete, @"rejected", @"RestoreEngine: RGB output not 3ch"); return; }
+        oh = osh[2].intValue; ow = osh[3].intValue;
+      }
+      const size_t oplane = (size_t)oh * ow;
+      if ((size_t)output.count < 3 * oplane) {
+        CanopyReject(complete, @"rejected", @"RestoreEngine: RGB output smaller than its shape"); return;
+      }
+      const float *outPtr = (const float *)output.dataPointer;
+
+      if (sx == 0) {                                    // first tile: fix the integer scale + size the canvas
+        if (oh % D != 0 || ow % D != 0) { CanopyReject(complete, @"rejected", @"RestoreEngine: RGB output not an integer multiple of D"); return; }
+        sy = oh / D; sx = ow / D;
+        if (sx <= 0 || sy <= 0) { CanopyReject(complete, @"rejected", @"RestoreEngine: RGB scale <= 0"); return; }
+        cw = npx * sx; ch = npy * sy;
+        // Defensive (parity with the cpp): reject an absurd output + fail gracefully on OOM rather than
+        // let std::bad_alloc unwind out of the worker.
+        if ((long long)cw * ch > 80LL * 1000 * 1000) {
+          CanopyReject(complete, @"rejected", @"RestoreEngine: output exceeds the 80 MP canvas cap"); return;
+        }
+        try {
+          canR.assign((size_t)cw * ch, 0.0f); canG.assign((size_t)cw * ch, 0.0f); canB.assign((size_t)cw * ch, 0.0f);
+        } catch (const std::bad_alloc &) {
+          CanopyReject(complete, @"rejected", @"RestoreEngine: out of memory allocating the restore canvas"); return;
+        }
+      } else if (oh != D * sy || ow != D * sx) {
+        CanopyReject(complete, @"rejected", @"RestoreEngine: inconsistent tile output size"); return;
+      }
+
+      // Stitch this tile's central span [cs,ce) into the canvas (centrals partition [0,np) → no seams).
+      for (int y = ty.cs; y < ty.ce; ++y) {
+        for (int oyy = 0; oyy < sy; ++oyy) {
+          const int canvasY = y * sy + oyy, tileY = (y - ty.win) * sy + oyy;
+          for (int x = tx.cs; x < tx.ce; ++x) {
+            const int tileX0 = (x - tx.win) * sx, canvasX0 = x * sx;
+            for (int oxx = 0; oxx < sx; ++oxx) {
+              const size_t ci = (size_t)canvasY * cw + (canvasX0 + oxx);
+              const size_t ti = (size_t)tileY * ow + (tileX0 + oxx);
+              canR[ci] = outPtr[ti] * 255.0f;
+              canG[ci] = outPtr[oplane + ti] * 255.0f;
+              canB[ci] = outPtr[2 * oplane + ti] * 255.0f;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (sx == 0) { CanopyReject(complete, @"rejected", @"RestoreEngine: no tiles produced"); return; }
+  if (cancelled->load()) { CanopyReject(complete, @"cancelled", @"process cancelled"); return; }
+
+  const int OW = W * sx, OH = H * sy;
+  std::vector<float> baseR, baseG, baseB;
+  canopy::Blob out;
+  out.kind = "rgba8";
+  out.width = OW; out.height = OH;
+  try {
+    baseR = resizePlane(R, W, H, OW, OH);
+    baseG = resizePlane(G, W, H, OW, OH);
+    baseB = resizePlane(B, W, H, OW, OH);
+    out.bytes.resize((size_t)OW * OH * 4);
+  } catch (const std::bad_alloc &) {
+    CanopyReject(complete, @"rejected", @"RestoreEngine: out of memory allocating the restore output"); return;
+  }
+  for (int y = 0; y < OH; ++y) {
+    for (int x = 0; x < OW; ++x) {
+      const size_t i = (size_t)y * OW + x, ci = (size_t)y * cw + x;   // canvas (npx*sx) >= OW (W*sx)
+      float r = baseR[i] * (1.0f - s) + canR[ci] * s;
+      float g = baseG[i] * (1.0f - s) + canG[ci] * s;
+      float b = baseB[i] * (1.0f - s) + canB[ci] * s;
+      out.bytes[i * 4 + 0] = clampByte(r);
+      out.bytes[i * 4 + 1] = clampByte(g);
+      out.bytes[i * 4 + 2] = clampByte(b);
+      out.bytes[i * 4 + 3] = 255;
+    }
+  }
+  canopy::BlobHandle outHandle = canopy::globalBlobRegistry().put(std::move(out));
+  CanopyResolve(complete, @{ @"image": @(outHandle), @"width": @(OW), @"height": @(OH) });
+}
+
+// ---- the L->ab colorize pass (1-ch in / 2-ch out) ---------------------------------------------
+// Mirrors RestoreEngineModule.cpp::runProcessColorize (shared RestoreColor.h): host computes L, tiles
+// L/100 through [1,1,D,D]->[1,2,D,D], stitches predicted ab into full-res canvases, recombines the kept
+// L with ab_real=(ab*2-1)*110 (chroma scaled by `strength`; 0 = grayscale) -> RGB. Same H×W out.
+- (void)runProcessColorize:(std::shared_ptr<canopy::Blob>)in
+                  strength:(double)strength
+                 cancelled:(std::shared_ptr<std::atomic<bool>>)cancelled
+                  complete:(CanopyComplete)complete {
+  const int W = in->width, H = in->height;
+  const size_t npix = (size_t)W * H;
+  const int D = _inDim;
+  const int over = MIN(32, D / 4 > 0 ? D / 4 : 1);
+  const float s = (float)strength;
+  const uint8_t *px = in->bytes.data();
+
+  std::vector<float> Lf(npix);
+  for (size_t i = 0; i < npix; ++i) {
+    float L, a, b;
+    canopy::rgbToLab(px[i * 4 + 0] / 255.0f, px[i * 4 + 1] / 255.0f, px[i * 4 + 2] / 255.0f, L, a, b);
+    Lf[i] = L;
+  }
+
+  int npx = D, npy = D;
+  std::vector<canopy::Tile1D> txs = canopy::tileCover(W, D, over, npx);
+  std::vector<canopy::Tile1D> tys = canopy::tileCover(H, D, over, npy);
+  const size_t plane = (size_t)D * D;
+  const int cw = npx, ch = npy;
+  std::vector<float> aCan, bCan;
+  try {
+    aCan.assign((size_t)cw * ch, 0.0f); bCan.assign((size_t)cw * ch, 0.0f);
+  } catch (const std::bad_alloc &) { CanopyReject(complete, @"rejected", @"RestoreEngine: out of memory (colorize canvas)"); return; }
+
+  MLModelDescription *desc = _model.modelDescription;
+  NSString *inName = desc.inputDescriptionsByName.allKeys.firstObject ?: @"input";
+  NSString *outName = desc.outputDescriptionsByName.allKeys.firstObject ?: @"output";
+  bool ran = false;
+
+  for (const canopy::Tile1D &ty : tys) {
+    for (const canopy::Tile1D &tx : txs) {
+      if (cancelled->load()) { CanopyReject(complete, @"cancelled", @"process cancelled"); return; }
+      NSError *maErr = nil;
+      MLMultiArray *input = [[MLMultiArray alloc] initWithShape:@[ @1, @1, @(D), @(D) ]
+                                                       dataType:MLMultiArrayDataTypeFloat32 error:&maErr];
+      if (input == nil) { CanopyReject(complete, @"rejected", @"RestoreEngine: colorize input alloc failed"); return; }
+      float *dst = (float *)input.dataPointer;
+      for (int yy = 0; yy < D; ++yy) {
+        int syc = ty.win + yy; if (syc < 0) syc = 0; else if (syc >= H) syc = H - 1;
+        for (int xx = 0; xx < D; ++xx) {
+          int sxc = tx.win + xx; if (sxc < 0) sxc = 0; else if (sxc >= W) sxc = W - 1;
+          dst[(size_t)yy * D + xx] = Lf[(size_t)syc * W + sxc] / 100.0f;
+        }
+      }
+      MLDictionaryFeatureProvider *features =
+          [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{ inName: input } error:&maErr];
+      if (features == nil) { CanopyReject(complete, @"rejected", @"RestoreEngine: colorize feature provider failed"); return; }
+      NSError *predErr = nil;
+      id<MLFeatureProvider> result = [_model predictionFromFeatures:features error:&predErr];
+      if (result == nil) { CanopyReject(complete, @"rejected", @"RestoreEngine: colorize prediction failed"); return; }
+      MLMultiArray *output = [result featureValueForName:outName].multiArrayValue;
+      if (output == nil || output.dataType != MLMultiArrayDataTypeFloat32) {
+        CanopyReject(complete, @"rejected", @"RestoreEngine: colorize output missing/!float32"); return;
+      }
+      NSArray<NSNumber *> *osh = output.shape;
+      if (osh.count != 4 || osh[1].intValue != 2 || osh[2].intValue != D || osh[3].intValue != D) {
+        CanopyReject(complete, @"rejected", @"RestoreEngine: colorize output is not [1,2,D,D]"); return;
+      }
+      if ((size_t)output.count < 2 * plane) {
+        CanopyReject(complete, @"rejected", @"RestoreEngine: colorize output smaller than its shape"); return;
+      }
+      const float *od = (const float *)output.dataPointer;
+      ran = true;
+      for (int y = ty.cs; y < ty.ce; ++y) {
+        for (int x = tx.cs; x < tx.ce; ++x) {
+          const size_t ci = (size_t)y * cw + x;
+          const size_t ti = (size_t)(y - ty.win) * D + (x - tx.win);
+          aCan[ci] = od[ti]; bCan[ci] = od[plane + ti];
+        }
+      }
+    }
+  }
+  if (!ran) { CanopyReject(complete, @"rejected", @"RestoreEngine: colorize produced no tiles"); return; }
+  if (cancelled->load()) { CanopyReject(complete, @"cancelled", @"process cancelled"); return; }
+
+  canopy::Blob out;
+  out.kind = "rgba8";
+  out.width = W; out.height = H;
+  try { out.bytes.resize(npix * 4); }
+  catch (const std::bad_alloc &) { CanopyReject(complete, @"rejected", @"RestoreEngine: out of memory (colorize output)"); return; }
+  for (int y = 0; y < H; ++y) {
+    for (int x = 0; x < W; ++x) {
+      const size_t i = (size_t)y * W + x, ci = (size_t)y * cw + x;
+      const float aReal = (aCan[ci] * 2.0f - 1.0f) * 110.0f * s;
+      const float bReal = (bCan[ci] * 2.0f - 1.0f) * 110.0f * s;
+      float r, g, b;
+      canopy::labToRgb(Lf[i], aReal, bReal, r, g, b);
+      out.bytes[i * 4 + 0] = clampByte(r * 255.0f);
+      out.bytes[i * 4 + 1] = clampByte(g * 255.0f);
+      out.bytes[i * 4 + 2] = clampByte(b * 255.0f);
+      out.bytes[i * 4 + 3] = 255;
+    }
+  }
+  canopy::BlobHandle outHandle = canopy::globalBlobRegistry().put(std::move(out));
+  CanopyResolve(complete, @{ @"image": @(outHandle), @"width": @(W), @"height": @(H) });
 }
 
 // Run the Core ML model on a 224x224 Y plane, producing a 672x672 Y plane. Returns NO with
@@ -335,6 +609,21 @@ static std::vector<float> resizePlane(const std::vector<float>& src, int srcW, i
   NSError *loadErr = nil;
   _model = [MLModel modelWithContentsOfURL:compiledURL configuration:config error:&loadErr];
   if (_model == nil) { if (error) { *error = @"load"; } return NO; }
+
+  // Read the I/O contract from the model's shape (mirrors the cpp OrtState). Flexible/empty shapes
+  // keep the ESPCN stand-in fallback. [N,C,H,W].
+  _inChannels = 1; _inDim = kModelIn; _outChannels = 1;
+  MLModelDescription *d = _model.modelDescription;
+  NSString *inKey = d.inputDescriptionsByName.allKeys.firstObject;
+  NSArray<NSNumber *> *ishape = inKey ? d.inputDescriptionsByName[inKey].multiArrayConstraint.shape : nil;
+  if (ishape.count == 4) {
+    if (ishape[1].intValue > 0) { _inChannels = ishape[1].intValue; }
+    if (ishape[2].intValue > 0) { _inDim = ishape[2].intValue; }
+  }
+  NSString *outKey = d.outputDescriptionsByName.allKeys.firstObject;
+  NSArray<NSNumber *> *oshape = outKey ? d.outputDescriptionsByName[outKey].multiArrayConstraint.shape : nil;
+  if (oshape.count == 4 && oshape[1].intValue > 0) { _outChannels = oshape[1].intValue; }
+  _rgb = (_inChannels == 3);
   return YES;
 }
 
