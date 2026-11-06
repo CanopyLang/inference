@@ -33,7 +33,6 @@
 // Wire contract (must match RestoreEngine.can / RestoreEngineModule.h):
 //   process     {image:<handle>, options:{upscale,restoreFaces,colorize,strength}}
 //                                                  -> {image:<handle>, width, height}
-//   release     {image:<handle>}                  -> null
 //   deviceTier  {}                                -> {tier:"ane"|"gpu"|"cpu"}
 
 #import <Foundation/Foundation.h>
@@ -142,13 +141,6 @@ static std::vector<float> resizePlane(const std::vector<float>& src, int srcW, i
             complete:(CanopyComplete)complete {
   if ([method isEqualToString:@"deviceTier"]) {
     CanopyResolve(complete, @{ @"tier": [self deviceTier] });
-    return YES;
-  }
-  if ([method isEqualToString:@"release"]) {
-    NSDictionary *args = CanopyParseArgs(argsJson);
-    canopy::BlobHandle h = (canopy::BlobHandle)[args[@"image"] intValue];
-    canopy::globalBlobRegistry().release(h);
-    CanopyResolveNull(complete);
     return YES;
   }
   if ([method isEqualToString:@"process"]) {

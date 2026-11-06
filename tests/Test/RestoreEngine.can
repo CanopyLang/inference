@@ -3,13 +3,13 @@ module Test.RestoreEngine exposing (main, tests)
 {-| Pure-value unit tests for the `canopy/inference` `RestoreEngine` API — runs entirely on
 Linux, no native, no host.
 
-`process` and `processBlob` produce an opaque `Cmd msg` whose JSON wire shape cannot be
-introspected from pure Canopy, so these tests guard what IS pure-observable: that the public
-surface used by app code (e.g. Lumen's Main.can) exists and that the `Options` contract both
-restoration entry points forward is exactly the documented one. The wire shape itself
+`process` produces an opaque `Cmd msg` whose JSON wire shape cannot be introspected from pure
+Canopy, so these tests guard what IS pure-observable: that the public surface used by app code
+(e.g. Lumen's Main.can) exists and that the `Options` contract it forwards is exactly the
+documented one. The wire shape itself
 (method `"process"`, key `"image"`:int, `"options"`:object) is exercised end-to-end by the
 Lumen headless smoke (apps/lumen/harness/smoke.js), which asserts a real RestoreEngine.process
-call carrying an int blob handle when `processBlob` runs.
+call carrying an int blob handle when `process` runs on a picked photo.
 -}
 
 import Basics exposing (..)
@@ -55,7 +55,7 @@ defaultsTests =
 
 optionsShapeTests : Test
 optionsShapeTests =
-    describe "Options — the record both process and processBlob forward"
+    describe "Options — the record process forwards"
         [ test "an Options can be constructed with all four fields and read back" <|
             \() ->
                 let

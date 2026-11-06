@@ -1,12 +1,11 @@
 // RestoreEngineModule.h — the ORT-backed photo-restoration capability (the canopy/inference
-// host module). The ONE C++ NativeModule among the C2 capabilities, the heavy-compute sibling
+// package module, autolinked from native.json). The ONE C++ NativeModule among the C2 capabilities, the heavy-compute sibling
 // of EchoModule: where EchoModule sleeps on a worker thread and echoes, RestoreEngineModule
 // runs an ONNX Runtime session over a real model on a worker thread and writes pixels.
 //
 // THE CONTRACT (module "RestoreEngine"):
 //   process     args {image:<handle>, options:{upscale,restoreFaces,colorize,strength}}
 //                                                   -> {image:<handle>, width, height}
-//   release     args {image:<handle>}              -> null
 //   deviceTier  args {}                            -> {tier:"cpu"}   (stub)
 //
 // THREADING — identical to EchoModule's invariant (CONVENTIONS §1.B): invoke() spawns a
@@ -41,15 +40,18 @@
 // a {"code":"rejected"} error rather than crashing — the rest of the app keeps working.
 //
 // Portable C++: <onnxruntime_cxx_api.h> + std::thread + the portable CanopyModules/CanopyBlobs.
-// No JNI here (the model-bytes handoff is a plain byte vector); Android wires the AAsset read in
-// CanopyHostJni boot, iOS wires the NSBundle read — both just call setModelBytes().
+// No JNI here (the model-bytes handoff is a plain byte vector). On Android the generated boot
+// (an app's native.json "boot": { module, loadModelAsset }) reads the asset and the host routes the
+// bytes by module name to loadModel(); iOS runs Core ML instead (CanopyRestoreEngineModule.mm).
 
 #pragma once
 
 #include "CanopyModules.h"
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -75,6 +77,13 @@ class RestoreEngineModule : public NativeModule {
   // extracted the asset to (returns false if the file can't be read). Either this or
   // setModelBytes must be called before the first process().
   bool loadModelFromFile(const std::string& path);
+
+  // The generic model hook (NativeModule::loadModel): the host's loadModelForModule("RestoreEngine",
+  // bytes) lands here. Same as setModelBytes; always accepts.
+  bool loadModel(const std::uint8_t* data, std::size_t len) override {
+    setModelBytes(data, len);
+    return true;
+  }
 
  private:
   struct OrtState;                 // defined in the .cpp (holds Ort::Env / Session / names / contract)
@@ -113,5 +122,9 @@ class RestoreEngineModule : public NativeModule {
   std::vector<uint8_t> modelBytes_;
   std::shared_ptr<OrtState> ort_;  // nullptr until first successful build (OrtState fwd-declared above)
 };
+
+// The process-wide instance the autolinker registers (native.json "factory"). One per process, so
+// model bytes loaded at boot survive a runtime reload, like globalBillingModule().
+std::shared_ptr<RestoreEngineModule> globalRestoreEngineModule();
 
 }  // namespace canopy

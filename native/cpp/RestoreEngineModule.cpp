@@ -215,6 +215,11 @@ void RestoreEngineModule::setModelBytes(const uint8_t* data, size_t len) {
   ort_.reset();  // force a rebuild on next process() if bytes were swapped
 }
 
+std::shared_ptr<RestoreEngineModule> globalRestoreEngineModule() {
+  static const std::shared_ptr<RestoreEngineModule> instance = std::make_shared<RestoreEngineModule>();
+  return instance;
+}
+
 bool RestoreEngineModule::loadModelFromFile(const std::string& path) {
   std::FILE* f = std::fopen(path.c_str(), "rb");
   if (f == nullptr) { return false; }
@@ -240,13 +245,6 @@ bool RestoreEngineModule::invoke(CallContext& ctx) {
   if (method == "deviceTier") {
     // Stub: the ESPCN stand-in always runs on the CPU execution provider.
     ctx.complete("", R"({"tier":"cpu"})");
-    return true;
-  }
-
-  if (method == "release") {
-    int handle = jsonInt(ctx.argsJson, "image", 0);
-    if (handle != 0) { globalBlobRegistry().release(static_cast<BlobHandle>(handle)); }
-    ctx.complete("", "null");
     return true;
   }
 
