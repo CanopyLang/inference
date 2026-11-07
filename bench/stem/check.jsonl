@@ -1,0 +1,12 @@
+{"model": "spleeter4.onnx", "ep": "webgpu", "threads": 1, "power": "high-performance", "rel_err_sample": 1.295520775101977e-07, "abs_mean": 0.2500000011256417, "ref_abs_mean": 0.25}
+{"model": "spleeter4.fp16.onnx", "ep": "webgpu", "threads": 1, "power": "high-performance", "rel_err_sample": 1.0, "abs_mean": 0, "ref_abs_mean": 0.25}
+{"model": "spleeter4.onnx", "ep": "webgpu", "threads": 1, "power": "low-power", "rel_err_sample": 1.3252794417439873e-07, "abs_mean": 0.2499999999164898, "ref_abs_mean": 0.25}
+{"model": "htdemucs.onnx", "ep": "webgpu", "threads": 1, "power": "high-performance", "rel_err_sample": 5.89326810836792, "abs_mean": 0.8225052329140803, "ref_abs_mean": 0.14621812105178833}
+{"model": "htdemucs.fp16.onnx", "ep": "webgpu", "threads": 1, "power": "high-performance", "rel_err_sample": 1.0, "abs_mean": 0, "ref_abs_mean": 0.14621812105178833}
+{"model": "htdemucs.onnx", "ep": "webgpu", "threads": 1, "power": "low-power", "rel_err_sample": 1.0, "abs_mean": 0, "ref_abs_mean": 0.14621812105178833}
+{"model": "spleeter4.onnx", "ep": "wasm", "threads": 1, "power": "high-performance", "rel_err_sample": 4.3099134927615523e-08, "abs_mean": 0.2500000001399426, "ref_abs_mean": 0.25}
+{"model": "spleeter4.onnx", "ep": "wasm", "threads": 4, "power": "high-performance", "rel_err_sample": 4.3099134927615523e-08, "abs_mean": 0.2500000001399426, "ref_abs_mean": 0.25}
+{"model": "spleeter4.onnx", "ep": "wasm", "threads": 8, "power": "high-performance", "rel_err_sample": 3.332388587296009e-08, "abs_mean": 0.2500000001366453, "ref_abs_mean": 0.25}
+{"model": "htdemucs.onnx", "ep": "wasm", "threads": 1, "power": "high-performance", "rel_err_sample": 0.000809039396699518, "abs_mean": 0.14623797289998255, "ref_abs_mean": 0.14621812105178833}
+{"model": "htdemucs.onnx", "ep": "wasm", "threads": 4, "power": "high-performance", "rel_err_sample": 0.0008091515628620982, "abs_mean": 0.14623796661724425, "ref_abs_mean": 0.14621812105178833}
+{"model": "htdemucs.onnx", "ep": "wasm", "threads": 8, "power": "high-performance", "rel_err_sample": 0.0008091902127489448, "abs_mean": 0.14623796986061516, "ref_abs_mean": 0.14621812105178833}

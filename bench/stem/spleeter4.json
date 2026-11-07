@@ -1,0 +1,50 @@
+{
+ "model": "spleeter-4stems",
+ "source": "https://github.com/deezer/spleeter/releases/download/v1.4.0/4stems.tar.gz",
+ "tarball_sha256": "3adb4a50ad4eb18c7c4d65fcf4cf2367a07d48408a5eb7d03cd20067429dfaa8",
+ "sources": [
+  "vocals",
+  "drums",
+  "bass",
+  "other"
+ ],
+ "samplerate": 44100,
+ "frame": 4096,
+ "hop": 1024,
+ "bins": 1024,
+ "chunk_frames": 512,
+ "chunk_seconds": 11.888616780045352,
+ "params": 39290900,
+ "input": [
+  2,
+  "n",
+  512,
+  1024
+ ],
+ "output": [
+  4,
+  2,
+  "n",
+  512,
+  1024
+ ],
+ "opset": 17,
+ "files": [
+  {
+   "name": "spleeter4.onnx",
+   "bytes": 157280686,
+   "sha256": "68bb9d6a372ee0382e2234b205ce1d25e6b87141fd66864ebcd657570ce7f737"
+  },
+  {
+   "name": "spleeter4.fp16.onnx",
+   "bytes": 78742965,
+   "sha256": "7da5976b217fcace67bbaa609b72828252f0caafc32c5007396811316cf1b21e"
+  }
+ ],
+ "max_abs_err_fp32": 0.0005449950695037842,
+ "max_abs_err_fp16": NaN,
+ "torch": "2.5.1+cpu",
+ "onnx": "1.17.0",
+ "onnxruntime": "1.20.1",
+ "tensorflow": "2.15.1"
+}
