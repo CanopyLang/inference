@@ -124,9 +124,9 @@ This finding is for edsite (NS16):
   - On a mismatch, or when no adapter exists, fall back to WASM SIMD with `min(hardwareConcurrency, 8)` threads. Threads need crossOriginIsolated, per contract §2.
 - **The StemSeparator:**
   - Decode the audio to 44.1 kHz stereo.
-  - Run the host STFT (Hann 4096 / hop 1024, first 1024 bins), then 512-frame chunks with overlap.
+  - Run the host STFT (Hann 4096 / hop 1024, first 1024 bins), then non-overlapping 512-frame chunks (spleeter itself does not overlap segments; the ISTFT's overlap-add runs across chunk edges).
   - Multiply each mask by the complex STFT, then ISTFT with overlap-add.
-  - Write four stems to OPFS as they finish, so a track never sits whole in memory.
+  - Write four stems to OPFS as they finish, so no stem sits whole in memory (the decoded input does, at 8 bytes per stereo frame).
 - **The bench page** extends `bench.mjs` to a real 3-minute track and records per-stage timings and peak memory.
 
 ## 6. Rerun
@@ -142,4 +142,84 @@ python export_spleeter.py models && python export_htdemucs.py models
 python bench-serve.py --root www --out results.jsonl --runs 5 \
   spleeter4.onnx:webgpu:1 spleeter4.onnx:webgpu:1:low-power spleeter4.onnx:wasm:4 htdemucs.onnx:wasm:8
 python check-outputs.py models www/results.jsonl
+```
+
+## 7. NS17b: the host as built (2026-11-07)
+
+**What landed.** `src/StemSeparator.can` (`separate : Config -> File -> Task Error Separation`) over
+`external/stem-separator.js`, which imports the engine from the mount's `_/`:
+
+- `external/stem/stem-separator.mjs` decodes the file (Web Audio, 44.1 kHz stereo; mono is duplicated) on the
+  page and transfers the PCM to `stem-worker.mjs`, a module Worker.
+- `model-store.mjs` loads the model from its chunk manifest (contract §6): each `.part` is SHA-256-checked, kept
+  in OPFS under its hash, and the whole file is checked again; a second run reads OPFS and fetches nothing.
+- `pickBackend` creates the WebGPU session first and runs the descriptor's reference chunk; it is used only if
+  its 512 reference values agree within 1e-3, else WASM SIMD (`min(cores, 8)` threads when cross-origin
+  isolated). No agreeing backend is the named error `no_backend_agrees`.
+- `spleeter-dsp.mjs` is spleeter's own framing (4096 zeros prepended, periodic Hann 4096 / hop 1024,
+  `pad_end`, first 1024 bins, masks zero above, ISTFT window x 2/3, crop) on a radix-2 FFT (`fft.mjs`), one
+  chunk at a time. `wav.mjs` streams each stem to OPFS as 16-bit WAV.
+- `make-mount.py` writes the mount files: 10 chunks of 16 MiB, the manifest and the `spleeter4.stem.json`
+  descriptor with the ORT-CPU reference.
+
+**Timings and memory** (`separate.html` + `separate-serve.py`, headless Chrome 153, ORT-web 1.20.1, build
+box: 32 cores, NVIDIA Ampere and Intel Gen12LP adapters; 3:00 track, 16 chunks, seconds; run 2 reads the model
+from OPFS). "Peak" is the Chrome process tree's PSS peak over its idle baseline, sampled every 100 ms.
+
+| case | run | backend | model load | session+verify | STFT | infer | ISTFT | write | decode | total | peak |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| voice-180.m4a:auto | 1 | webgpu (nvidia) | 2.8 (filled) | 2.3 | 1.8 | 6.9 | 5.9 | 0.1 | 0.5 | 20.6 | 1.21 GiB |
+| voice-180.m4a:auto | 2 | webgpu (nvidia) | 0.3 (hit) | 1.8 | 1.2 | 8.1 | 4.5 | 0.2 | 0.5 | 16.8 |  |
+| voice-180.m4a:webgpu::low-power | 1 | webgpu (intel) | 2.7 (filled) | 3.5 | 1.2 | 34.3 | 4.5 | 0.1 | 0.4 | 46.8 | 1.04 GiB |
+| voice-180.m4a:webgpu::low-power | 2 | webgpu (intel) | 0.2 (hit) | 3.1 | 1.1 | 34.1 | 4.3 | 0.0 | 0.3 | 43.2 |  |
+| voice-180.m4a:wasm:8 | 1 | wasm x8 | 3.0 (filled) | 1.1 | 1.2 | 7.9 | 4.5 | 0.4 | 0.4 | 18.6 | 0.96 GiB |
+| voice-180.m4a:wasm:8 | 2 | wasm x8 | 0.2 (hit) | 1.1 | 1.0 | 6.4 | 3.7 | 0.1 | 0.4 | 13.0 |  |
+| voice-180.m4a:wasm:4 | 1 | wasm x4 | 3.5 (filled) | 1.4 | 1.0 | 9.9 | 3.6 | 0.1 | 0.9 | 20.8 | 0.88 GiB |
+| voice-180.m4a:wasm:4 | 2 | wasm x4 | 0.2 (hit) | 1.2 | 1.1 | 9.8 | 4.1 | 0.1 | 0.3 | 17.0 |  |
+| voice-180.m4a:wasm:1 | 1 | wasm x1 | 4.3 (filled) | 3.8 | 1.4 | 27.9 | 4.4 | 0.1 | 0.8 | 42.9 | 0.85 GiB |
+| voice-180.m4a:wasm:1 | 2 | wasm x1 | 0.2 (hit) | 2.6 | 1.1 | 25.9 | 4.0 | 0.3 | 0.3 | 34.5 |  |
+| synth-180.wav:wasm:8 | 1 | wasm x8 | 1.0 (filled) | 1.1 | 1.1 | 6.8 | 4.0 | 0.1 | 0.3 | 14.6 | 0.96 GiB |
+| synth-180.wav:wasm:8 | 2 | wasm x8 | 0.2 (hit) | 1.2 | 1.2 | 6.7 | 4.1 | 0.1 | 0.2 | 13.8 |  |
+| synth-180.wav:auto | 1 | webgpu (nvidia) | 2.5 (filled) | 1.5 | 1.1 | 5.5 | 3.9 | 0.1 | 0.4 | 15.3 | 1.22 GiB |
+| synth-180.wav:auto | 2 | webgpu (nvidia) | 0.3 (hit) | 1.6 | 1.0 | 8.1 | 3.5 | 0.3 | 0.4 | 15.3 |  |
+
+- A 3-minute track separates in 13–21 s on WASM x8 or the discrete GPU, 43–47 s on the integrated GPU and
+  35–43 s single-threaded. Every case wrote four 31.75 MB stems.
+- WASM x8 matches the discrete GPU here; the GPU's win is on machines with fewer cores. Inference is half the
+  time; the JS STFT/ISTFT is most of the rest.
+- Peak memory over baseline is 0.85–0.96 GiB on WASM and 1.04–1.22 GiB on WebGPU. That is the number the
+  memory gate row must be set from (it does not exist yet; see the CHANGELOG and lane report).
+- The four-file split of §4 (one U-Net resident at a time) was not built: the single file's peak is under
+  1.25 GiB, and the split costs four session creates.
+
+**Agreement with spleeter's own pipeline** (`ref-separate.py`, TF STFT/ISTFT, masks on ORT CPU, SNR in dB per
+stem: vocals / drums / bass / other):
+
+| comparison | vocals | drums | bass | other |
+|---|---|---|---|---|
+| noise floor: ORT CPU, graph optimisation off vs on | 24.7 | 43.9 | 30.4 | 40.5 |
+| host on WebGPU (synth track) | 27.1 | 46.3 | 32.7 | 42.9 |
+| host on WASM x8 (synth track) | 18.3 | 39.6 | 24.0 | 34.9 |
+| host on WebGPU from the AAC file vs the reference from its WAV source (includes the AAC round trip) | 17.5 | 28.0 | 16.0 | 16.6 |
+
+- The host's DSP alone (numpy check, all-ones masks) reconstructs at 150.9 dB, so the DSP is not where the gap
+  is. The model is ill-conditioned on these inputs: 1e-6 of input noise, or turning ORT's graph optimisation
+  off, moves single mask values by up to 0.37. The noise floor row is that effect on CPU alone.
+- WebGPU sits above that floor. WASM sits about 6 dB below it and is unexplained; its reference-chunk error
+  is 1.0e-6 (WebGPU 3.6e-6), so it is accumulated divergence, not a wrong kernel.
+- **Wiring check on a real voice** (a spoken episode over the synthetic music, `score-voice.py`): the vocals
+  stem scores SI-SDR -2.9 dB against the voice and the other three summed -13.9 dB, on every backend.
+  Spleeter's own pipeline on the same mix scores -2.7 / -14.1. The voice lands in vocals; the absolute
+  quality is the 2019 model's on speech over synthetic tones, not the host's.
+
+**Rerun** (build box, the §6 venv plus ffmpeg and Chrome):
+
+```bash
+python make-mount.py models/spleeter4.onnx models/spleeter4.json www/_   # chunks, manifest, descriptor
+python make-track.py www/tracks/synth-180.wav
+python make-track.py www/tracks/voice-180.wav --voice EPISODE.m4a
+python separate-serve.py --root www --out results.jsonl --stems stems --runs 2 \
+  voice-180.m4a:auto voice-180.m4a:webgpu::low-power voice-180.m4a:wasm:8 voice-180.m4a:wasm:1 synth-180.wav:auto
+python score-voice.py www/tracks/voice-180.voice.wav stems/voice-180.m4a_auto stem
+python ref-separate.py --float64 models/spleeter4.onnx www/tracks/synth-180.wav stems/synth-180.wav_auto stem
 ```

@@ -1,0 +1,296 @@
+module StemSeparator exposing
+    ( Config, Backend(..)
+    , separate
+    , Separation, Stem, Timings
+    , Error(..), errorToString
+    , revoke
+    )
+
+{-| Split a music track into four stems (vocals, drums, bass, other) in the browser — the web half of
+`canopy/inference` (NS17b).
+
+The engine is ES modules served from a Canopy mount's `_/` (edsite `docs/canopy-mount-contract.md`):
+a module Worker loads the Spleeter 4stems model from its chunk manifest, checks every chunk's SHA-256
+and keeps the bytes in OPFS, picks WebGPU when it reproduces the model's reference chunk and WASM SIMD
+otherwise, and writes each stem to OPFS as it is finalised, so a track never sits whole in memory four
+times over.
+
+    StemSeparator.separate config file
+        |> Task.attempt Separated
+
+# Configuration
+@docs Config, Backend
+
+# Separation
+@docs separate, Separation, Stem, Timings, revoke
+
+# Errors
+@docs Error, errorToString
+
+-}
+
+import File exposing (File)
+import Json.Decode as Decode
+import Json.Encode as Encode
+import Task exposing (Task)
+
+
+foreign import javascript "external/stem-separator.js" as StemFFI
+
+
+
+-- CONFIG
+
+
+{-| Where the engine's files are. Every URL but `base` resolves against `base`, the mount's `_/`.
+
+  - `engine`: `stem-separator.mjs`; `worker`: `stem-worker.mjs`
+  - `descriptor`: the model descriptor (`spleeter4.stem.json`, built by `bench/stem/make-mount.py`)
+  - `ortModule`: `ort.webgpu.min.mjs`; `ortWasmPaths`: the prefix ORT-web loads its `.wasm` from
+  - `outPrefix`: the OPFS file prefix of this track's stems
+
+-}
+type alias Config =
+    { base : String
+    , engine : String
+    , worker : String
+    , descriptor : String
+    , ortModule : String
+    , ortWasmPaths : String
+    , backend : Backend
+    , outPrefix : String
+    }
+
+
+{-| Which backend to try. `Auto` is WebGPU, then WASM SIMD; a backend is used only when it reproduces
+the model's reference chunk.
+-}
+type Backend
+    = Auto
+    | WebGpu
+    | Wasm
+
+
+backendName : Backend -> String
+backendName backend =
+    case backend of
+        Auto ->
+            "auto"
+
+        WebGpu ->
+            "webgpu"
+
+        Wasm ->
+            "wasm"
+
+
+encodeConfig : Config -> Encode.Value
+encodeConfig c =
+    Encode.object
+        [ ( "base", Encode.string c.base )
+        , ( "engine", Encode.string c.engine )
+        , ( "worker", Encode.string c.worker )
+        , ( "descriptor", Encode.string c.descriptor )
+        , ( "ortModule", Encode.string c.ortModule )
+        , ( "ortWasmPaths", Encode.string c.ortWasmPaths )
+        , ( "backend", Encode.string (backendName c.backend) )
+        , ( "outPrefix", Encode.string c.outPrefix )
+        ]
+
+
+
+-- RESULT
+
+
+{-| One separated source: its name, its OPFS file name, its size, and an object URL for an `audio`
+element or a download link (free it with `revoke`).
+-}
+type alias Stem =
+    { name : String
+    , file : String
+    , bytes : Int
+    , url : String
+    }
+
+
+{-| Milliseconds per stage, measured in the page and the worker. -}
+type alias Timings =
+    { decodeMs : Float
+    , modelMs : Float
+    , sessionMs : Float
+    , verifyMs : Float
+    , stftMs : Float
+    , inferMs : Float
+    , istftMs : Float
+    , writeMs : Float
+    , totalMs : Float
+    }
+
+
+{-| A finished separation. `backend` is `"webgpu"` or `"wasm"`; `modelCache` is `"hit"` (read from
+OPFS), `"filled"` (downloaded and kept) or `"none"` (no OPFS: downloaded every visit).
+-}
+type alias Separation =
+    { stems : List Stem
+    , backend : String
+    , threads : Maybe Int
+    , seconds : Float
+    , chunks : Int
+    , modelCache : String
+    , storage : String
+    , timings : Timings
+    }
+
+
+stemDecoder : Decode.Decoder Stem
+stemDecoder =
+    Decode.map4 Stem
+        (Decode.field "name" Decode.string)
+        (Decode.field "file" Decode.string)
+        (Decode.field "bytes" Decode.int)
+        (Decode.field "url" Decode.string)
+
+
+timingsDecoder : Decode.Decoder Timings
+timingsDecoder =
+    let
+        ms name =
+            Decode.oneOf [ Decode.field name Decode.float, Decode.succeed 0 ]
+    in
+    Decode.succeed Timings
+        |> andMap (ms "decodeMs")
+        |> andMap (ms "modelMs")
+        |> andMap (ms "sessionMs")
+        |> andMap (ms "verifyMs")
+        |> andMap (ms "stftMs")
+        |> andMap (ms "inferMs")
+        |> andMap (ms "istftMs")
+        |> andMap (ms "writeMs")
+        |> andMap (ms "totalMs")
+
+
+separationDecoder : Decode.Decoder Separation
+separationDecoder =
+    Decode.succeed Separation
+        |> andMap (Decode.field "stems" (Decode.list stemDecoder))
+        |> andMap (Decode.at [ "backend", "ep" ] Decode.string)
+        |> andMap (Decode.at [ "backend", "threads" ] (Decode.nullable Decode.int))
+        |> andMap (Decode.field "seconds" Decode.float)
+        |> andMap (Decode.field "chunks" Decode.int)
+        |> andMap (Decode.at [ "model", "cache" ] Decode.string)
+        |> andMap (Decode.field "storage" Decode.string)
+        |> andMap (Decode.field "timings" timingsDecoder)
+
+
+andMap : Decode.Decoder a -> Decode.Decoder (a -> b) -> Decode.Decoder b
+andMap =
+    Decode.map2 (|>)
+
+
+
+-- ERRORS
+
+
+{-| Why a separation stopped, by name. -}
+type Error
+    = NoBackendAgrees
+    | ModelFetchFailed String
+    | ModelCorrupt String
+    | AudioDecodeFailed String
+    | WorkerFailed String
+    | Unexpected String
+
+
+errorDecoder : Decode.Decoder Error
+errorDecoder =
+    Decode.map2 toError
+        (Decode.field "code" Decode.string)
+        (Decode.field "message" Decode.string)
+
+
+toError : String -> String -> Error
+toError code message =
+    case code of
+        "no_backend_agrees" ->
+            NoBackendAgrees
+
+        "manifest_fetch_failed" ->
+            ModelFetchFailed message
+
+        "model_chunk_fetch_failed" ->
+            ModelFetchFailed message
+
+        "model_chunk_sha_mismatch" ->
+            ModelCorrupt message
+
+        "model_sha_mismatch" ->
+            ModelCorrupt message
+
+        "manifest_sha_mismatch" ->
+            ModelCorrupt message
+
+        "audio_decode_failed" ->
+            AudioDecodeFailed message
+
+        "worker_failed" ->
+            WorkerFailed message
+
+        _ ->
+            Unexpected message
+
+
+{-| A one-line reading of an error. -}
+errorToString : Error -> String
+errorToString error =
+    case error of
+        NoBackendAgrees ->
+            "no backend reproduced the model's reference chunk"
+
+        ModelFetchFailed m ->
+            "model download failed: " ++ m
+
+        ModelCorrupt m ->
+            "model bytes failed their SHA-256 check: " ++ m
+
+        AudioDecodeFailed m ->
+            "the track could not be decoded: " ++ m
+
+        WorkerFailed m ->
+            "the separation worker failed: " ++ m
+
+        Unexpected m ->
+            m
+
+
+
+-- SEPARATE
+
+
+{-| Separate one track. The Task fails with a named `Error`; it never retries silently. -}
+separate : Config -> File -> Task Error Separation
+separate config file =
+    StemFFI.separate (encodeConfig config) file
+        |> Task.mapError
+            (\v ->
+                case Decode.decodeValue errorDecoder v of
+                    Ok e ->
+                        e
+
+                    Err e ->
+                        Unexpected (Decode.errorToString e)
+            )
+        |> Task.andThen
+            (\v ->
+                case Decode.decodeValue separationDecoder v of
+                    Ok s ->
+                        Task.succeed s
+
+                    Err e ->
+                        Task.fail (Unexpected (Decode.errorToString e))
+            )
+
+
+{-| Free a stem's object URL once nothing plays or links it. -}
+revoke : Stem -> Task Never ()
+revoke stem =
+    StemFFI.revoke stem.url

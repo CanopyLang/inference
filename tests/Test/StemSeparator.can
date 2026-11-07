@@ -1,0 +1,58 @@
+module Test.StemSeparator exposing (main, tests)
+
+{-| Pure-value tests for `StemSeparator`: the public surface app code builds on (Config, Backend,
+the named errors and their readings). The engine itself runs in a browser; its end-to-end check is
+`bench/stem/separate-serve.py` with `ref-separate.py` (README §6).
+-}
+
+import Basics exposing (..)
+import Expect
+import File exposing (File)
+import StemSeparator exposing (Backend(..), Config, Error(..))
+import Task exposing (Task)
+import Test exposing (..)
+
+
+main : Test
+main =
+    tests
+
+
+config : Config
+config =
+    { base = "/tools/stems/_/"
+    , engine = "stem-separator.mjs"
+    , worker = "stem-worker.mjs"
+    , descriptor = "spleeter4.stem.json"
+    , ortModule = "ort/ort.webgpu.min.mjs"
+    , ortWasmPaths = "ort/"
+    , backend = Auto
+    , outPrefix = "track"
+    }
+
+
+separateTyped : File -> Task Error StemSeparator.Separation
+separateTyped =
+    StemSeparator.separate config
+
+
+tests : Test
+tests =
+    describe "StemSeparator"
+        [ test "a Config carries the backend it was given" <|
+            \() ->
+                { config | backend = Wasm }.backend
+                    |> Expect.equal Wasm
+        , test "every error reads as one named line" <|
+            \() ->
+                List.map StemSeparator.errorToString
+                    [ NoBackendAgrees, ModelFetchFailed "x", ModelCorrupt "y", AudioDecodeFailed "z", WorkerFailed "w", Unexpected "u" ]
+                    |> Expect.equal
+                        [ "no backend reproduced the model's reference chunk"
+                        , "model download failed: x"
+                        , "model bytes failed their SHA-256 check: y"
+                        , "the track could not be decoded: z"
+                        , "the separation worker failed: w"
+                        , "u"
+                        ]
+        ]

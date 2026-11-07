@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- New `StemSeparator` (web): `separate : Config -> File -> Task Error Separation` splits a track into
+  vocals, drums, bass and other in the browser (NS17b). The engine is ES modules in `external/stem/`,
+  served from a Canopy mount's `_/` (edsite `docs/canopy-mount-contract.md`): a module Worker loads
+  Spleeter 4stems from its chunk manifest (each chunk SHA-256-checked, kept in OPFS), uses WebGPU only
+  when it reproduces the model's reference chunk and WASM SIMD otherwise, and writes each stem to OPFS as
+  16-bit WAV while it separates. Errors are named (`NoBackendAgrees`, `ModelCorrupt`, ...). Adds the
+  canopy/file dependency. The bench and its results: `bench/stem/README.md` §7.
+
 - The package's `native/cpp` is now the only copy of `RestoreEngineModule.{cpp,h}`,
   `RestoreTiling.h` and `RestoreColor.h` (canopy/native's host copies are deleted). `native.json`
   declares the factory `globalRestoreEngineModule` (header `RestoreEngineModule.h`), so the
