@@ -5,6 +5,7 @@
 import { SpleeterChunker } from "./spleeter-dsp.mjs";
 import { loadModel } from "./model-store.mjs";
 import { WavSink } from "./wav.mjs";
+import { admit, deviceMemoryBytes } from "./memory-gate.mjs";
 
 const now = () => performance.now();
 const post = (m, t) => self.postMessage(m, t || []);
@@ -37,11 +38,11 @@ async function adapterInfo(power) {
   return { vendor: i.vendor, architecture: i.architecture, description: i.description };
 }
 
-// Tries each backend in order; keeps the first whose reference error is within the descriptor's bound.
-async function pickBackend(ort, model, desc, opts, timings) {
-  const attempts = [];
-  const order = opts.prefer === "wasm" ? ["wasm"] : opts.prefer === "webgpu" ? ["webgpu"] : ["webgpu", "wasm"];
-  for (const ep of order) {
+// Tries each backend the memory gate admitted, in order; keeps the first whose reference error is within
+// the descriptor's bound. The backends the gate refused open the attempts list, each named.
+async function pickBackend(ort, model, desc, opts, timings, memory) {
+  const attempts = [...memory.refused];
+  for (const ep of memory.admitted) {
     const a = { ep };
     attempts.push(a);
     try {
@@ -71,8 +72,12 @@ async function pickBackend(ort, model, desc, opts, timings) {
   throw Object.assign(new Error("no_backend_agrees"), { attempts });
 }
 
+const orderOf = (prefer) => prefer === "wasm" ? ["wasm"] : prefer === "webgpu" ? ["webgpu"] : ["webgpu", "wasm"];
+
 async function separate(m) {
   const t0 = now(), timings = {};
+  // Before any model byte is fetched: a device below every admitted backend's floor stops here.
+  const memory = admit(orderOf(m.prefer), m.memoryGate || {}, deviceMemoryBytes(self.navigator));
   const ort = await import(m.ort.module);
   ort.env.wasm.wasmPaths = m.ort.wasmPaths;
   ort.env.wasm.numThreads = m.threads || (self.crossOriginIsolated ? Math.min(navigator.hardwareConcurrency || 1, 8) : 1);
@@ -81,7 +86,7 @@ async function separate(m) {
   const desc = await (await fetch(descUrl)).json();
   const model = await loadModel(desc.model, descUrl, progress);
   timings.modelMs = now() - t;
-  const picked = await pickBackend(ort, model.bytes, desc, m, timings);
+  const picked = await pickBackend(ort, model.bytes, desc, m, timings, memory);
   const modelInfo = { name: desc.name, sha256: model.sha256, bytes: model.bytes.byteLength, cache: model.cache, fetched: model.fetched, chunks: model.chunks };
   model.bytes = null;
 
@@ -112,6 +117,7 @@ async function separate(m) {
     type: "done",
     result: {
       model: modelInfo, backend: { ep: picked.ep, threads: picked.ep === "wasm" ? ort.env.wasm.numThreads : null, attempts: picked.attempts },
+      memory: { deviceBytes: memory.deviceBytes, reading: memory.reading, gateBytes: m.memoryGate[picked.ep] },
       isolated: self.crossOriginIsolated, storage: dir ? "opfs" : "memory",
       frames: ck.len, seconds: ck.len / desc.sampleRate, chunks: ck.numChunks, timings, perChunk,
       stems: desc.sources.map((s, i) => ({ name: s, file: sinks[i].name, bytes: files[i].size, blob: files[i] })),

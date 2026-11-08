@@ -13,7 +13,8 @@ The engine is ES modules served from a Canopy mount's `_/` (edsite `docs/canopy-
 a module Worker loads the Spleeter 4stems model from its chunk manifest, checks every chunk's SHA-256
 and keeps the bytes in OPFS, picks WebGPU when it reproduces the model's reference chunk and WASM SIMD
 otherwise, and writes each stem to OPFS as it is finalised, so a track never sits whole in memory four
-times over.
+times over. A backend whose memory floor (the dashboard's gate rows, handed to the page as the tool's
+thresholds) is above the memory the device reports is refused before any model byte is fetched.
 
     StemSeparator.separate config file
         |> Task.attempt Separated
@@ -48,6 +49,9 @@ foreign import javascript "external/stem-separator.js" as StemFFI
   - `descriptor`: the model descriptor (`spleeter4.stem.json`, built by `bench/stem/make-mount.py`)
   - `ortModule`: `ort.webgpu.min.mjs`; `ortWasmPaths`: the prefix ORT-web loads its `.wasm` from
   - `outPrefix`: the OPFS file prefix of this track's stems
+  - `thresholds`: the tool's thresholds object as the tool page hands it over (edsite
+    `docs/canopy-mount-contract.md` §6). It must hold `tools.stem_peak_webgpu_bytes` and
+    `tools.stem_peak_wasm_bytes`, the measured peak per backend; a missing one is `MemoryGateMissing`.
 
 -}
 type alias Config =
@@ -59,6 +63,7 @@ type alias Config =
     , ortWasmPaths : String
     , backend : Backend
     , outPrefix : String
+    , thresholds : Encode.Value
     }
 
 
@@ -95,6 +100,7 @@ encodeConfig c =
         , ( "ortWasmPaths", Encode.string c.ortWasmPaths )
         , ( "backend", Encode.string (backendName c.backend) )
         , ( "outPrefix", Encode.string c.outPrefix )
+        , ( "thresholds", c.thresholds )
         ]
 
 
@@ -128,7 +134,8 @@ type alias Timings =
 
 
 {-| A finished separation. `backend` is `"webgpu"` or `"wasm"`; `modelCache` is `"hit"` (read from
-OPFS), `"filled"` (downloaded and kept) or `"none"` (no OPFS: downloaded every visit).
+OPFS), `"filled"` (downloaded and kept) or `"none"` (no OPFS: downloaded every visit). `deviceMemory`
+is the memory the browser reported in bytes, `Nothing` when it reports none (the gate then admits).
 -}
 type alias Separation =
     { stems : List Stem
@@ -138,6 +145,7 @@ type alias Separation =
     , chunks : Int
     , modelCache : String
     , storage : String
+    , deviceMemory : Maybe Int
     , timings : Timings
     }
 
@@ -179,6 +187,7 @@ separationDecoder =
         |> andMap (Decode.field "chunks" Decode.int)
         |> andMap (Decode.at [ "model", "cache" ] Decode.string)
         |> andMap (Decode.field "storage" Decode.string)
+        |> andMap (Decode.at [ "memory", "deviceBytes" ] (Decode.nullable Decode.int))
         |> andMap (Decode.field "timings" timingsDecoder)
 
 
@@ -194,6 +203,8 @@ andMap =
 {-| Why a separation stopped, by name. -}
 type Error
     = NoBackendAgrees
+    | MemoryGateMissing String
+    | DeviceMemoryBelowGate String
     | ModelFetchFailed String
     | ModelCorrupt String
     | AudioDecodeFailed String
@@ -213,6 +224,12 @@ toError code message =
     case code of
         "no_backend_agrees" ->
             NoBackendAgrees
+
+        "memory_gate_missing" ->
+            MemoryGateMissing message
+
+        "device_memory_below_gate" ->
+            DeviceMemoryBelowGate message
 
         "manifest_fetch_failed" ->
             ModelFetchFailed message
@@ -245,6 +262,12 @@ errorToString error =
     case error of
         NoBackendAgrees ->
             "no backend reproduced the model's reference chunk"
+
+        MemoryGateMissing m ->
+            "the tool page carries no memory gate row: " ++ m
+
+        DeviceMemoryBelowGate m ->
+            "this device reports less memory than the separation needs: " ++ m
 
         ModelFetchFailed m ->
             "model download failed: " ++ m

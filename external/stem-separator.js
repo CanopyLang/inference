@@ -19,7 +19,7 @@ var separate = F2(function(config, file) {
             return engine.separate(file, {
                 base: base.href, worker: c.worker, descriptor: c.descriptor,
                 ort: { module: c.ortModule, wasmPaths: c.ortWasmPaths },
-                prefer: c.backend, outPrefix: c.outPrefix
+                prefer: c.backend, outPrefix: c.outPrefix, thresholds: c.thresholds
             });
         }).then(function(r) {
             r.stems = r.stems.map(function(s) {

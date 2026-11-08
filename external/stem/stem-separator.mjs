@@ -3,7 +3,10 @@
 // The Canopy face is src/StemSeparator.can through external/stem-separator.js.
 //
 // opts: { base, worker, descriptor, ort: { module, wasmPaths }, prefer: "auto"|"webgpu"|"wasm",
-//         power, threads, outPrefix, onProgress }  — URLs resolve against `base` (the mount's `_/`).
+//         power, threads, outPrefix, onProgress, thresholds }  — URLs resolve against `base` (the mount's
+//         `_/`); `thresholds` is the tool's thresholds object, which must hold the memory gate rows.
+
+import { readGate } from "./memory-gate.mjs";
 
 export async function decode(input, rate) {
   const buf = input instanceof ArrayBuffer ? input
@@ -24,6 +27,7 @@ const absolute = (w, base) => typeof w === "string" ? new URL(w, base).href
 
 export async function separate(input, opts) {
   const t0 = performance.now(), base = new URL(opts.base, location.href);
+  const memoryGate = readGate(opts.thresholds); // refuses memory_gate_missing:<key> before decoding
   const rate = opts.sampleRate || 44100;
   let t = performance.now();
   const pcm = await decode(input, rate);
@@ -41,7 +45,7 @@ export async function separate(input, opts) {
       worker.postMessage({
         type: "separate", base: base.href, descriptor: opts.descriptor,
         ort: { module: new URL(opts.ort.module, base).href, wasmPaths: absolute(opts.ort.wasmPaths, base) },
-        prefer: opts.prefer || "auto", power: opts.power, threads: opts.threads,
+        prefer: opts.prefer || "auto", power: opts.power, threads: opts.threads, memoryGate,
         outPrefix: opts.outPrefix || "track", left: pcm.left, right: pcm.right,
       }, [pcm.left.buffer, pcm.right.buffer]);
     });

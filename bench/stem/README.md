@@ -187,10 +187,25 @@ from OPFS). "Peak" is the Chrome process tree's PSS peak over its idle baseline,
   35–43 s single-threaded. Every case wrote four 31.75 MB stems.
 - WASM x8 matches the discrete GPU here; the GPU's win is on machines with fewer cores. Inference is half the
   time; the JS STFT/ISTFT is most of the rest.
-- Peak memory over baseline is 0.85–0.96 GiB on WASM and 1.04–1.22 GiB on WebGPU. That is the number the
-  memory gate row must be set from (it does not exist yet; see the CHANGELOG and lane report).
+- Peak memory over baseline is 0.85–0.96 GiB on WASM and 1.04–1.22 GiB on WebGPU. The memory gate rows are set
+  from it (below).
 - The four-file split of §4 (one U-Net resident at a time) was not built: the single file's peak is under
   1.25 GiB, and the split costs four session creates.
+
+**The memory gate** (2026-11-08). The dashboard holds one gate row per backend, migration
+`2205_edsite_tools_stem_memory_gates`: `edsite_tools.stem_peak_webgpu_bytes` = 1,304,731,648 and `edsite_tools.stem_peak_wasm_bytes` = 1,028,426,752: the
+run's largest `separationPeakBytes` per backend (synth-180.wav, auto and wasm:8). Both are welded (a new model or measurement is a new
+migration). The SiteConfig mapper writes them into a site's `thresholds` as `tools.stem_peak_*_bytes` when the tools
+plugin is on, and the tool page hands them to the app (contract §6).
+- `external/stem/memory-gate.mjs` reads them; a missing one is `memory_gate_missing:<key>` before the track is decoded.
+- Before any model byte is fetched, the worker drops each backend whose floor is above `navigator.deviceMemory`
+  (Chrome rounds it down to a power of two, so it never overstates). It names the drop in the attempts:
+  `device_memory_below_gate:<backend>`. With none left, the error is `device_memory_below_gate`, naming both
+  numbers. A browser that reports no memory (Firefox, Safari) is admitted, and the result says
+  `device_memory_unreported`.
+- `memory-gate.test.mjs` (`node --test`) holds those refusals. `separate-serve.py --thresholds` records each case's
+  `gateBytes` and `underGate`. Every case in the table above is under its backend's row, by construction: the
+  rows are the table's maxima.
 
 **Agreement with spleeter's own pipeline** (`ref-separate.py`, TF STFT/ISTFT, masks on ORT CPU, SNR in dB per
 stem: vocals / drums / bass / other):
@@ -218,7 +233,10 @@ stem: vocals / drums / bass / other):
 python make-mount.py models/spleeter4.onnx models/spleeter4.json www/_   # chunks, manifest, descriptor
 python make-track.py www/tracks/synth-180.wav
 python make-track.py www/tracks/voice-180.wav --voice EPISODE.m4a
-python separate-serve.py --root www --out results.jsonl --stems stems --runs 2 \
+# the gate rows as the tool page would hand them over (dashboard box, its DATABASE_URL)
+psql "$DATABASE_URL" -Atc "SELECT json_object_agg(replace(id, 'edsite_', ''), dashboard.resolve_gate(id, NULL, ''))
+  FROM dashboard.gate_def WHERE id LIKE 'edsite\_tools.stem\_peak\_%'" > thresholds.json
+python separate-serve.py --root www --out results.jsonl --stems stems --runs 2 --thresholds thresholds.json \
   voice-180.m4a:auto voice-180.m4a:webgpu::low-power voice-180.m4a:wasm:8 voice-180.m4a:wasm:1 synth-180.wav:auto
 python score-voice.py www/tracks/voice-180.voice.wav stems/voice-180.m4a_auto stem
 python ref-separate.py --float64 models/spleeter4.onnx www/tracks/synth-180.wav stems/synth-180.wav_auto stem

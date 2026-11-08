@@ -9,6 +9,11 @@
   when it reproduces the model's reference chunk and WASM SIMD otherwise, and writes each stem to OPFS as
   16-bit WAV while it separates. Errors are named (`NoBackendAgrees`, `ModelCorrupt`, ...). Adds the
   canopy/file dependency. The bench and its results: `bench/stem/README.md` §7.
+- `StemSeparator.Config` takes `thresholds`, the tool's thresholds object. The memory gate reads
+  `tools.stem_peak_webgpu_bytes` and `tools.stem_peak_wasm_bytes` from it (the dashboard's gate rows, the bench's
+  measured peaks). A missing row is `MemoryGateMissing`. A backend whose floor is above the memory the device
+  reports is refused before the model downloads, and with none left the error is `DeviceMemoryBelowGate`.
+  `Separation.deviceMemory` says what the browser reported (`Nothing`: none, admitted).
 
 - The package's `native/cpp` is now the only copy of `RestoreEngineModule.{cpp,h}`,
   `RestoreTiling.h` and `RestoreColor.h` (canopy/native's host copies are deleted). `native.json`

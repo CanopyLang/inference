@@ -3,10 +3,12 @@
 Chrome over each case, and sample the Chrome process tree's PSS (/proc smaps_rollup) every 100 ms for the
 peak, less the idle page's PSS the page marks before it starts (separationPeakBytes); one JSON line per case to --out, the last run's stems to --stems/<case>/.
 
-usage: separate-serve.py --root DIR --out results.jsonl --stems DIR CASE...   CASE is track:prefer[:threads[:power]]
+usage: separate-serve.py --root DIR --out results.jsonl --stems DIR --thresholds FILE CASE...
+       CASE is track:prefer[:threads[:power]]; FILE is the tool's thresholds JSON (README §7), which holds the
+       memory gate rows: each case records the gate of the backend it ran on and whether its peak stayed under it.
 Run it from a box shell, never the laptop.
 """
-import argparse, http.server, json, os, queue, re, subprocess, tempfile, threading, time
+import argparse, http.server, json, os, queue, re, subprocess, tempfile, threading, time, urllib.parse
 
 results = queue.Queue()
 stem_dir = [None]
@@ -74,9 +76,12 @@ def main():
     ap.add_argument("--chrome", default="/usr/bin/google-chrome"); ap.add_argument("--port", type=int, default=8792)
     ap.add_argument("--runs", type=int, default=2); ap.add_argument("--timeout", type=int, default=1800)
     ap.add_argument("--flags", default="--enable-unsafe-webgpu --enable-features=Vulkan --use-angle=vulkan --ignore-gpu-blocklist")
+    ap.add_argument("--thresholds", required=True)
     ap.add_argument("cases", nargs="+")
     a = ap.parse_args()
     root, stems, outp = os.path.abspath(a.root), os.path.abspath(a.stems), os.path.abspath(a.out)
+    thresholds = json.load(open(a.thresholds))
+    gate_of = {"webgpu": thresholds.get("tools.stem_peak_webgpu_bytes"), "wasm": thresholds.get("tools.stem_peak_wasm_bytes")}
     os.chdir(root)
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", a.port), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -88,7 +93,8 @@ def main():
             stem_dir[0] = os.path.join(stems, case.replace(":", "_"))
             os.makedirs(stem_dir[0], exist_ok=True)
             url = (f"http://127.0.0.1:{a.port}/separate.html?track={track}&prefer={prefer}&power={power}&runs={a.runs}"
-                   + (f"&threads={threads}" if threads else ""))
+                   + (f"&threads={threads}" if threads else "")
+                   + "&thresholds=" + urllib.parse.quote(json.dumps(thresholds)))
             with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as prof:
                 p = subprocess.Popen([a.chrome, "--headless=new", f"--user-data-dir={prof}", "--no-first-run",
                                       "--enable-blink-features=ForceEagerMeasureMemory", *a.flags.split(), url],
@@ -115,6 +121,10 @@ def main():
             # The separation's own cost: the tree's peak over its PSS on the loaded, idle page.
             r.update({"case": case, "chromePeakPssBytes": peak, "chromeBaselinePssBytes": base,
                       "separationPeakBytes": peak - base if base else None, "marks": seen, "flags": a.flags})
+            ep = (r.get("runs") or [{}])[-1].get("backend", {}).get("ep")
+            gate = gate_of.get(ep)
+            r.update({"gateBytes": gate, "underGate": (r["separationPeakBytes"] <= gate)
+                      if gate and r["separationPeakBytes"] is not None else None})
             out.write(json.dumps(r) + "\n"); out.flush()
             print(json.dumps(r), flush=True)
     srv.shutdown()

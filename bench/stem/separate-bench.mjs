@@ -1,6 +1,7 @@
 // NS17b bench: separate one whole track with the stem host (external/stem), twice in one profile (the
 // first run fills OPFS from the chunked mount, the second must read it), and post per-stage timings and
-// memory to separate-serve.py, then the last run's stems. Query: track, prefer, power, threads, runs.
+// memory to separate-serve.py, then the last run's stems. Query: track, prefer, power, threads, runs, and
+// thresholds (the tool's thresholds JSON, holding the memory gate rows the host refuses without).
 import { separate } from "./_/stem-separator.mjs";
 
 const q = new URLSearchParams(location.search);
@@ -26,6 +27,7 @@ async function main() {
         base: "./_/", worker: "stem-worker.mjs", descriptor: q.get("descriptor") || "spleeter4.stem.json",
         ort: { module: "ort/ort.webgpu.min.mjs", wasmPaths: "ort/" }, prefer: r.prefer, power: r.power,
         threads: q.get("threads") ? Number(q.get("threads")) : undefined, outPrefix: `run${i}`,
+        thresholds: JSON.parse(q.get("thresholds") || "null"),
       });
       const stems = res.stems.map(({ blob, ...s }) => s);
       r.runs.push({ ...res, stems, uaMemoryBytesAfter: await memory() });

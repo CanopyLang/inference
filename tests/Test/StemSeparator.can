@@ -8,6 +8,7 @@ the named errors and their readings). The engine itself runs in a browser; its e
 import Basics exposing (..)
 import Expect
 import File exposing (File)
+import Json.Encode as Encode
 import StemSeparator exposing (Backend(..), Config, Error(..))
 import Task exposing (Task)
 import Test exposing (..)
@@ -28,6 +29,11 @@ config =
     , ortWasmPaths = "ort/"
     , backend = Auto
     , outPrefix = "track"
+    , thresholds =
+        Encode.object
+            [ ( "tools.stem_peak_webgpu_bytes", Encode.int 1304731648 )
+            , ( "tools.stem_peak_wasm_bytes", Encode.int 1028426752 )
+            ]
     }
 
 
@@ -46,9 +52,11 @@ tests =
         , test "every error reads as one named line" <|
             \() ->
                 List.map StemSeparator.errorToString
-                    [ NoBackendAgrees, ModelFetchFailed "x", ModelCorrupt "y", AudioDecodeFailed "z", WorkerFailed "w", Unexpected "u" ]
+                    [ NoBackendAgrees, MemoryGateMissing "k", DeviceMemoryBelowGate "d", ModelFetchFailed "x", ModelCorrupt "y", AudioDecodeFailed "z", WorkerFailed "w", Unexpected "u" ]
                     |> Expect.equal
                         [ "no backend reproduced the model's reference chunk"
+                        , "the tool page carries no memory gate row: k"
+                        , "this device reports less memory than the separation needs: d"
                         , "model download failed: x"
                         , "model bytes failed their SHA-256 check: y"
                         , "the track could not be decoded: z"
